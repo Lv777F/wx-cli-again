@@ -139,14 +139,20 @@ curl -fsSL https://raw.githubusercontent.com/botiverse/wx-cli/main/install.sh | 
 # 必须：本机 GUI Terminal + sudo（系统可能提示授予「开发者工具」权限，请允许）
 sudo wx init
 
-# 若提示缺分片密钥 / meta.unknown_shards 非空：加长 hook，等待期间在微信里点开相关聊天
+# 若提示缺分片密钥 / meta.unknown_shards 非空：先重启微信，再抓
+# （数据库连接是长期持有的，不重启的话 PBKDF 断点不会被命中）
+killall WeChat; open -a WeChat
 sudo wx key extract --hook-seconds 90
 ```
 
 `wx init` 两阶段取密钥（**都不依赖关 SIP**）：
 
 1. 进程内存扫描（`x'key+salt'` + salt 邻接）
-2. LLDB hook `CCCryptorCreate`，补齐尚未加载进内存的 per-DB AES key
+2. LLDB hook `CCKeyDerivationPBKDF`（**密钥派生**函数），补齐尚未加载进内存的 per-DB key。
+   `rounds=2` 的那次调用里 `password` 参数**就是**该库的 `enc_key`；`rounds=256000` 的
+   是 raw passphrase，需按各库自己的 salt（`.db` 文件头前 16 字节）派生。
+   **hook 前必须先重启微信** —— 数据库连接是长期持有的，`mac_key` 一旦派生就缓存住，
+   不重启的话断点永远不会命中。
 
 说明：
 
