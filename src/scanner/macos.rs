@@ -5,9 +5,12 @@
 ///    - 搜索 `x'<64hex_key><32hex_salt>'` 传统 WCDB 缓存格式
 ///    - 按每个 DB 的 16-byte salt 在堆中找相邻 32-byte raw key
 /// 2. **LLDB hook**（补齐冷分片密钥：用户滚动/打开会话时触发 DB 打开）
-///    - attach 到 WeChat，hook CommonCrypto `CCCryptorCreate` 等
-///    - 捕获 32-byte AES key，用 SQLCipher 4 HMAC 与磁盘 DB 匹配
-///    - Hardened Runtime 官方包建议 sudo；部分官网包本身 ad-hoc，用户态 LLDB 即可
+///    - attach 到 WeChat，hook CommonCrypto 的密钥派生函数 `CCKeyDerivationPBKDF`
+///      （**不是** `CCCrypt*`：DB 密钥在派生调用的参数里流过，不在 AES 函数上）
+///    - `rounds=2` 的调用里 password 直接就是某库的 enc_key；
+///      `rounds=256000` 的调用里是 raw passphrase，需按各库自己的 salt 派生
+///    - 用 SQLCipher 4 的 HMAC 与磁盘 DB 逐一匹配
+///    - 需要 sudo；且必须**重启微信**，否则连接已建立、断点永远不会被命中
 ///
 /// 官方 Hardened Runtime 包在本机 GUI Terminal + sudo 下通常可 `task_for_pid`；
 /// 部分官网包本身就是 ad-hoc，无需也不应再重签。
@@ -230,6 +233,7 @@ pub fn scan_keys_with_options(
             pid,
             hook_seconds,
             is_root || matches!(signature, SignatureKind::AdHoc),
+            &db_salts,
         ) {
             Ok(hooked) => {
                 eprintln!("LLDB hook 捕获到 {} 个 32-byte key", hooked.len());
@@ -461,13 +465,25 @@ fn scan_region(
     bytes_read
 }
 
-/// 通过 LLDB 在用户/root 态 hook CommonCrypto，捕获 AES-256 key。
+/// 通过 LLDB 在用户/root 态 hook CommonCrypto，捕获数据库密钥。
 ///
-/// 微信 4.x（尤其是 Tencent 官网 ad-hoc 包）在打开加密 DB 时会调用
-/// `CCCryptorCreate` / `CCCryptorCreateWithMode`；此时 keyLength==32。
+/// 关键：要 hook 的是 **`CCKeyDerivationPBKDF`**（密钥派生），而不是
+/// `CCCryptorCreate` / `CCCryptorCreateWithMode`（那是 AES 加解密那一层）。
+/// 微信 4.x 的 DB 密钥在派生的调用参数里流过，不会以裸 32 字节出现在 AES 函数上：
+///
+///   enc_key = PBKDF2-HMAC-SHA512(passphrase, 该库文件头前16字节, 256000 轮, 32B)
+///   mac_key = PBKDF2-HMAC-SHA512(enc_key,    salt ^ 0x3a,          2 轮,   32B)
+///
+/// 因此 `rounds=256000` 的调用给出 passphrase（需按各库自己的 salt 再派生），
+/// 而 `rounds=2` 的调用里 password 参数直接就是该库的 enc_key。
 ///
 /// 脚本在 `seconds` 后自动 `process detach`，避免强杀 lldb 把微信留在 SIGSTOP。
-fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Result<Vec<String>> {
+fn hook_keys_via_lldb(
+    pid: libc::pid_t,
+    seconds: u64,
+    allow_user: bool,
+    db_salts: &[(String, String)],
+) -> Result<Vec<String>> {
     let lldb = find_lldb()
         .context("找不到 lldb。请安装 Xcode Command Line Tools：xcode-select --install")?;
 
@@ -498,6 +514,7 @@ fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Resul
             keys_path.to_string_lossy().as_ref(),
             done_path.to_string_lossy().as_ref(),
             seconds,
+            db_salts,
         ),
     )?;
 
@@ -533,17 +550,29 @@ fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Resul
             break;
         }
         if let Some(status) = child.try_wait()? {
-            if !status.success() && !keys_path.exists() {
+            // keys 文件是为了收紧权限而被预先创建的，所以用 exists() 判断必然为真，
+            // 会把 lldb 启动失败 / attach 失败静默伪装成「捕获到 0 个 key」。
+            // 必须看文件里到底有没有内容。
+            let produced = std::fs::metadata(&keys_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            if !produced {
                 let mut stderr = String::new();
                 if let Some(mut s) = child.stderr.take() {
                     use std::io::Read;
                     let _ = s.read_to_string(&mut stderr);
                 }
                 let _ = std::fs::remove_dir_all(&tmp_dir);
+                let tail: String = stderr.chars().take(400).collect();
+                if !status.success() {
+                    bail!("lldb 退出异常: {} {}", status, tail);
+                }
                 bail!(
-                    "lldb 退出异常: {} {}",
-                    status,
-                    stderr.chars().take(400).collect::<String>()
+                    "lldb 已退出但没有捕获到任何密钥（CCKeyDerivationPBKDF 未命中）。\n\
+                     最常见的原因：微信的数据库连接是长期持有的，mac_key 早已派生并缓存，\n\
+                     此时无论 hook 挂多久都不会有调用。请重启微信后重试。\n\
+                     lldb stderr: {}",
+                    tail
                 );
             }
             break;
@@ -603,14 +632,35 @@ fn find_lldb() -> Option<PathBuf> {
     None
 }
 
-fn lldb_hook_script(keys_path: &str, done_path: &str, seconds: u64) -> String {
+fn lldb_hook_script(
+    keys_path: &str,
+    done_path: &str,
+    seconds: u64,
+    db_salts: &[(String, String)],
+) -> String {
+    // 微信 4.x 的数据库密钥走 SQLCipher 4 的标准两级派生，全部经过
+    // CCKeyDerivationPBKDF，而不是 CCCrypt* 那一层 AES 加解密：
+    //
+    //   enc_key = PBKDF2-HMAC-SHA512(passphrase, 该库文件头前16字节, 256000 轮, 32B)
+    //   mac_key = PBKDF2-HMAC-SHA512(enc_key,    salt ^ 0x3a,          2 轮,   32B)
+    //
+    // 因此 hook 点必须是 CCKeyDerivationPBKDF：
+    //   - rounds=256000 的调用里，password 是 raw passphrase，
+    //     要按每个库自己的 salt 再派生一次才得到该库的 enc_key；
+    //   - rounds=2 的调用里，password 直接就是 enc_key（它在派生 mac_key）。
+    //
     // arm64 ABI:
-    //   CCCryptorCreate(op, alg, options, key, keyLength, iv, cryptorRef)
-    //     x3=key, x4=keyLength
-    //   CCCryptorCreateWithMode(op, mode, alg, padding, iv, key, keyLength, ...)
-    //     x5=key, x6=keyLength
+    //   CCKeyDerivationPBKDF(algorithm, password, passwordLen, salt, saltLen,
+    //                        prf, rounds, derivedKey, derivedKeyLen)
+    //     x1=password, x2=passwordLen, x6=rounds
+    let salt_list = db_salts
+        .iter()
+        .map(|(s, _)| format!("\"{}\"", s))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         r#"# auto-generated by wx-cli
+import hashlib
 import lldb
 import threading
 import time
@@ -618,47 +668,55 @@ import time
 OUT = r"{keys_path}"
 DONE = r"{done_path}"
 SECONDS = {seconds}
+DB_SALTS = [{salt_list}]
 captured = set()
+seen_passphrases = set()
 _debugger = None
 
 def _save(hx):
+    if hx in captured:
+        return
+    captured.add(hx)
     try:
         with open(OUT, "a") as f:
             f.write(hx + "\n")
     except Exception:
         pass
 
-def _try_read(process, key_ptr, key_len):
-    if key_len != 32 or not key_ptr:
-        return
-    err = lldb.SBError()
-    data = process.ReadMemory(key_ptr, 32, err)
-    if not err.Success() or not data or len(data) != 32:
-        return
-    hx = bytes(data).hex()
-    if hx in captured:
-        return
-    captured.add(hx)
-    print("[wx-cli hook] key " + hx, flush=True)
-    _save(hx)
+def _derive_all(passphrase, rounds):
+    for raw in DB_SALTS:
+        try:
+            salt = bytes.fromhex(raw)[:16]
+        except ValueError:
+            continue
+        if len(salt) != 16:
+            continue
+        try:
+            hx = hashlib.pbkdf2_hmac("sha512", passphrase, salt, rounds, dklen=32).hex()
+        except Exception:
+            continue
+        _save(hx)
 
-def on_cc(frame, bp_loc, _dict):
+def on_pbkdf(frame, bp_loc, _dict):
     try:
         process = frame.GetThread().GetProcess()
-        arch = process.GetTarget().GetTriple()
-        if "arm64" in arch or "aarch64" in arch:
-            x3 = frame.FindRegister("x3").GetValueAsUnsigned()
-            x4 = frame.FindRegister("x4").GetValueAsUnsigned()
-            x5 = frame.FindRegister("x5").GetValueAsUnsigned()
-            x6 = frame.FindRegister("x6").GetValueAsUnsigned()
-            _try_read(process, x3, x4)
-            _try_read(process, x5, x6)
-        else:
-            rcx = frame.FindRegister("rcx").GetValueAsUnsigned()
-            r8 = frame.FindRegister("r8").GetValueAsUnsigned()
-            r9 = frame.FindRegister("r9").GetValueAsUnsigned()
-            _try_read(process, rcx, r8)
-            _try_read(process, r9, 32)
+        x1 = frame.FindRegister("x1").GetValueAsUnsigned()
+        x2 = frame.FindRegister("x2").GetValueAsUnsigned()
+        x6 = frame.FindRegister("x6").GetValueAsUnsigned()
+        if not x1 or not x2 or x2 > 256:
+            return False
+        err = lldb.SBError()
+        data = process.ReadMemory(x1, x2, err)
+        if not err.Success() or not data or len(data) != x2:
+            return False
+        pw = bytes(data)
+        if x6 == 2 and x2 == 32:
+            print("[wx-cli hook] enc_key via mac_key derivation", flush=True)
+            _save(pw.hex())
+        elif x6 >= 1000 and pw not in seen_passphrases:
+            seen_passphrases.add(pw)
+            print("[wx-cli hook] passphrase rounds=" + str(x6) + " -> deriving per-db keys", flush=True)
+            _derive_all(pw, x6)
     except Exception as e:
         print("[wx-cli hook] err " + str(e), flush=True)
     return False
@@ -680,11 +738,11 @@ def __lldb_init_module(debugger, _internal_dict):
     global _debugger
     _debugger = debugger
     target = debugger.GetSelectedTarget()
+    if not target or not target.IsValid():
+        print("[wx-cli hook] no valid target", flush=True)
+        return
     names = [
-        "CCCryptorCreate",
-        "CCCrypt",
-        "CCCryptorCreateWithMode",
-        "CCCryptorCreateFromData",
+        "CCKeyDerivationPBKDF",
     ]
     for name in names:
         bp = target.BreakpointCreateByName(name)
@@ -692,11 +750,11 @@ def __lldb_init_module(debugger, _internal_dict):
         if n == 0:
             print("[wx-cli hook] skip " + name, flush=True)
             continue
-        bp.SetScriptCallbackFunction(__name__ + ".on_cc")
+        bp.SetScriptCallbackFunction(__name__ + ".on_pbkdf")
         bp.SetAutoContinue(True)
         print("[wx-cli hook] " + name + " locs=" + str(n), flush=True)
     open(OUT, "w").close()
-    print("[wx-cli hook] ready for %ds → %s" % (SECONDS, OUT), flush=True)
+    print("[wx-cli hook] ready for %ds -> %s" % (SECONDS, OUT), flush=True)
     t = threading.Thread(target=_finish, daemon=True)
     t.start()
 "#
